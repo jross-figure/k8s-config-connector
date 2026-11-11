@@ -20,16 +20,17 @@ import (
 	"testing"
 
 	operatorv1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/operator/pkg/apis/core/v1beta1"
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+const (
+	testMCLImage    = "gcr.io/gke-release/cnrm/multiclusterlease:1.161.0"
+	testSyncerImage = "gcr.io/gke-release/cnrm/krmsyncer:1.161.0"
+)
+
 func TestClusterConfigurerApplyIsIdempotent(t *testing.T) {
-	const kccImage = "gcr.io/gke-release/cnrm/controller:1.158.0"
-	handle := newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", newBaseConfigConnector(), newManagerStatefulSet(kccImage))
-	cfg, err := newClusterConfigurer(context.Background(), handle, "kcc-multicluster-lease", "cnrm-system", "my-ha-bucket")
+	handle := newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", newBaseConfigConnector())
+	cfg, err := newClusterConfigurer(context.Background(), handle, testMCLImage, testSyncerImage, "kcc-multicluster-lease", "cnrm-system", "my-ha-bucket")
 	if err != nil {
 		t.Fatalf("newClusterConfigurer failed: %v", err)
 	}
@@ -45,9 +46,8 @@ func TestClusterConfigurerApplyIsIdempotent(t *testing.T) {
 }
 
 func TestClusterConfigurerApplySkipsConfigConnectorUpdateOnManifestError(t *testing.T) {
-	const kccImage = "gcr.io/gke-release/cnrm/controller:1.158.0"
-	handle := newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", newBaseConfigConnector(), newManagerStatefulSet(kccImage))
-	cfg, err := newClusterConfigurer(context.Background(), handle, "kcc-multicluster-lease", "cnrm-system", "my-ha-bucket")
+	handle := newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", newBaseConfigConnector())
+	cfg, err := newClusterConfigurer(context.Background(), handle, testMCLImage, testSyncerImage, "kcc-multicluster-lease", "cnrm-system", "my-ha-bucket")
 	if err != nil {
 		t.Fatalf("newClusterConfigurer failed: %v", err)
 	}
@@ -68,7 +68,6 @@ func TestClusterConfigurerApplySkipsConfigConnectorUpdateOnManifestError(t *test
 }
 
 func TestClusterConfigurerApplyPreservesExistingMultiClusterLeaseFields(t *testing.T) {
-	const kccImage = "gcr.io/gke-release/cnrm/controller:1.158.0"
 	existingGKECluster := operatorv1beta1.GKECluster{Project: "custom-proj", Location: "us-west1", Name: "custom-cluster"}
 	existingCC := newBaseConfigConnector()
 	existingCC.Spec.Experiments = &operatorv1beta1.CCExperiments{
@@ -79,8 +78,8 @@ func TestClusterConfigurerApplyPreservesExistingMultiClusterLeaseFields(t *testi
 			ResourceReplicationMode: "Full",
 		},
 	}
-	handle := newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", existingCC, newManagerStatefulSet(kccImage))
-	cfg, err := newClusterConfigurer(context.Background(), handle, "kcc-multicluster-lease", "cnrm-system", "my-ha-bucket")
+	handle := newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", existingCC)
+	cfg, err := newClusterConfigurer(context.Background(), handle, testMCLImage, testSyncerImage, "kcc-multicluster-lease", "cnrm-system", "my-ha-bucket")
 	if err != nil {
 		t.Fatalf("newClusterConfigurer failed: %v", err)
 	}
@@ -104,7 +103,6 @@ func TestClusterConfigurerApplyPreservesExistingMultiClusterLeaseFields(t *testi
 }
 
 func TestClusterConfigurerApplyReplacesDeprecatedClusterCandidateIdentity(t *testing.T) {
-	const kccImage = "gcr.io/gke-release/cnrm/controller:1.158.0"
 	existingCC := newBaseConfigConnector()
 	existingCC.Spec.Experiments = &operatorv1beta1.CCExperiments{
 		MultiClusterLease: &operatorv1beta1.MultiClusterLeaseSpec{
@@ -113,8 +111,8 @@ func TestClusterConfigurerApplyReplacesDeprecatedClusterCandidateIdentity(t *tes
 			ClusterCandidateIdentity: "legacy-identity-a",
 		},
 	}
-	handle := newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", existingCC, newManagerStatefulSet(kccImage))
-	cfg, err := newClusterConfigurer(context.Background(), handle, "kcc-multicluster-lease", "cnrm-system", "my-ha-bucket")
+	handle := newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", existingCC)
+	cfg, err := newClusterConfigurer(context.Background(), handle, testMCLImage, testSyncerImage, "kcc-multicluster-lease", "cnrm-system", "my-ha-bucket")
 	if err != nil {
 		t.Fatalf("newClusterConfigurer failed: %v", err)
 	}
@@ -138,34 +136,6 @@ func TestClusterConfigurerApplyReplacesDeprecatedClusterCandidateIdentity(t *tes
 	}
 	if want := "projects/proj-a/locations/us-central1/clusters/cluster-a"; identity != want {
 		t.Fatalf("got identity %q, want %q", identity, want)
-	}
-}
-
-func TestDiscoverControllerImagePrefersPrimaryManagerStatefulSet(t *testing.T) {
-	namespacedSts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "cnrm-controller-manager-ns1",
-			Namespace: controllerManagerNamespace,
-			Labels:    map[string]string{controllerComponentLabelKey: controllerManagerStatefulSet},
-		},
-		Spec: appsv1.StatefulSetSpec{
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{Name: "manager", Image: "gcr.io/old:1.0"}},
-				},
-			},
-		},
-	}
-	primarySts := newManagerStatefulSet("gcr.io/primary:2.0")
-	handle := newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", namespacedSts, primarySts)
-
-	got, err := discoverControllerImage(context.Background(), handle)
-
-	if err != nil {
-		t.Fatalf("discoverControllerImage failed: %v", err)
-	}
-	if got != "gcr.io/primary:2.0" {
-		t.Fatalf("got image %q, want %q", got, "gcr.io/primary:2.0")
 	}
 }
 

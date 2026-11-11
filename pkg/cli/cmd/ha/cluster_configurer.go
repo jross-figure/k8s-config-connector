@@ -21,7 +21,6 @@ import (
 	"io"
 
 	operatorv1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/operator/pkg/apis/core/v1beta1"
-	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -37,7 +36,7 @@ type clusterConfigurer struct {
 	manifests       *manifestBuilder
 }
 
-func newClusterConfigurer(ctx context.Context, handle *clusterHandle, leaseName, leaseNamespace, bucket string) (*clusterConfigurer, error) {
+func newClusterConfigurer(ctx context.Context, handle *clusterHandle, mclImage, syncerImage, leaseName, leaseNamespace, bucket string) (*clusterConfigurer, error) {
 	if handle == nil || handle.client == nil {
 		return nil, fmt.Errorf("cluster handle has a nil Kubernetes client")
 	}
@@ -52,12 +51,7 @@ func newClusterConfigurer(ctx context.Context, handle *clusterHandle, leaseName,
 		return nil, err
 	}
 
-	image, err := discoverControllerImage(ctx, handle)
-	if err != nil {
-		return nil, err
-	}
-
-	manifests := newManifestBuilder(gkeInfo.contextName, gkeInfo.gkeCluster(), gkeInfo.project, image, leaseName, leaseNamespace, bucket)
+	manifests := newManifestBuilder(gkeInfo.contextName, gkeInfo.gkeCluster(), gkeInfo.project, cc.Spec.Mode, mclImage, syncerImage, leaseName, leaseNamespace, bucket)
 	return &clusterConfigurer{
 		handle:          handle,
 		gkeInfo:         gkeInfo,
@@ -66,46 +60,8 @@ func newClusterConfigurer(ctx context.Context, handle *clusterHandle, leaseName,
 	}, nil
 }
 
-const (
-	controllerManagerNamespace   = "cnrm-system"
-	controllerComponentLabelKey  = "cnrm.cloud.google.com/component"
-	controllerManagerStatefulSet = "cnrm-controller-manager"
-)
-
-func discoverControllerImage(ctx context.Context, handle *clusterHandle) (string, error) {
-	stsList := &appsv1.StatefulSetList{}
-	if err := handle.client.List(
-		ctx,
-		stsList,
-		client.InNamespace(controllerManagerNamespace),
-		client.MatchingLabels{controllerComponentLabelKey: controllerManagerStatefulSet},
-	); err != nil {
-		return "", fmt.Errorf("listing Config Connector controller StatefulSets in namespace %q on cluster %q: %w", controllerManagerNamespace, handle.contextName, err)
-	}
-
-	var fallbackImage string
-	for _, sts := range stsList.Items {
-		for _, container := range sts.Spec.Template.Spec.Containers {
-			if container.Name == "manager" && container.Image != "" {
-				if sts.Name == controllerManagerStatefulSet {
-					return container.Image, nil
-				}
-
-				if fallbackImage == "" {
-					fallbackImage = container.Image
-				}
-			}
-		}
-	}
-
-	if fallbackImage != "" {
-		return fallbackImage, nil
-	}
-
-	return "", fmt.Errorf(
-		"could not find running Config Connector manager container image on cluster %q (expected StatefulSet with label %s=%s in namespace %q); verify Config Connector is installed and healthy",
-		handle.contextName, controllerComponentLabelKey, controllerManagerStatefulSet, controllerManagerNamespace,
-	)
+func (c *clusterConfigurer) setPeerProjects(peerProjects []string) {
+	c.manifests.setPeerProjects(peerProjects)
 }
 
 func (c *clusterConfigurer) apply(ctx context.Context, stdout io.Writer, dryRun bool) error {

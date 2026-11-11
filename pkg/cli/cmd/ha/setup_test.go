@@ -23,7 +23,6 @@ import (
 
 	operatorv1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/operator/pkg/apis/core/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -32,6 +31,8 @@ func TestSetupValidateNormalizesFields(t *testing.T) {
 	opts := newSetupOptions()
 	opts.contexts = []string{" cluster-a ", "cluster-b "}
 	opts.bucket = " gs://my-ha-bucket/ "
+	opts.mclImage = " " + testMCLImage + " "
+	opts.syncerImage = " " + testSyncerImage + " "
 
 	err := opts.validate()
 
@@ -45,6 +46,12 @@ func TestSetupValidateNormalizesFields(t *testing.T) {
 	if opts.bucket != "my-ha-bucket" {
 		t.Fatalf("got bucket %q, want %q", opts.bucket, "my-ha-bucket")
 	}
+	if opts.mclImage != testMCLImage {
+		t.Fatalf("got mclImage %q, want %q", opts.mclImage, testMCLImage)
+	}
+	if opts.syncerImage != testSyncerImage {
+		t.Fatalf("got syncerImage %q, want %q", opts.syncerImage, testSyncerImage)
+	}
 }
 
 func TestSetupValidateErrors(t *testing.T) {
@@ -54,6 +61,8 @@ func TestSetupValidateErrors(t *testing.T) {
 		bucket         string
 		leaseName      string
 		leaseNamespace string
+		mclImage       *string
+		syncerImage    *string
 		wantErr        string
 	}{
 		{
@@ -101,6 +110,14 @@ func TestSetupValidateErrors(t *testing.T) {
 			wantErr:        "--lease-name \"INVALID_LEASE!\" is not a valid DNS-1123 subdomain (a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')); use lowercase alphanumeric characters, '-' or '.'\n--lease-namespace \"BAD_NAMESPACE!\" is not a valid DNS-1123 namespace label (a lowercase RFC 1123 label must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character (e.g. 'my-name',  or '123-abc', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?')); use lowercase alphanumeric characters or '-'",
 		},
 		{
+			name:        "empty mcl-image and syncer-image",
+			contexts:    []string{"cluster-a", "cluster-b"},
+			bucket:      "my-bucket",
+			mclImage:    strPtr("   "),
+			syncerImage: strPtr(""),
+			wantErr:     "--mcl-image cannot be empty; specify the MultiClusterLease controller container image\n--syncer-image cannot be empty; specify the KRMSyncer controller container image",
+		},
+		{
 			name:     "accumulates multiple flag errors",
 			contexts: []string{"cluster-a"},
 			bucket:   "",
@@ -119,6 +136,12 @@ func TestSetupValidateErrors(t *testing.T) {
 			if tc.leaseNamespace != "" {
 				opts.leaseNamespace = tc.leaseNamespace
 			}
+			if tc.mclImage != nil {
+				opts.mclImage = *tc.mclImage
+			}
+			if tc.syncerImage != nil {
+				opts.syncerImage = *tc.syncerImage
+			}
 
 			err := opts.validate()
 
@@ -129,15 +152,20 @@ func TestSetupValidateErrors(t *testing.T) {
 	}
 }
 
+func strPtr(s string) *string {
+	return &s
+}
+
 func TestExecuteSetupAppliesManifestsAndConfiguresClusters(t *testing.T) {
-	const kccImage = "gcr.io/gke-release/cnrm/controller:1.158.0"
 	handles := []*clusterHandle{
-		newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", newBaseConfigConnector(), newManagerStatefulSet(kccImage)),
-		newFakeClusterHandle(t, "gke_proj-b_us-east1_cluster-b", newBaseConfigConnector(), newManagerStatefulSet(kccImage)),
+		newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", newBaseConfigConnector()),
+		newFakeClusterHandle(t, "gke_proj-b_us-east1_cluster-b", newBaseConfigConnector()),
 	}
 	runner := &recordingCommandRunner{}
 	opts := newSetupOptions()
 	opts.bucket = "my-ha-bucket"
+	opts.mclImage = testMCLImage
+	opts.syncerImage = testSyncerImage
 
 	err := executeSetup(context.Background(), opts, handles, runner)
 
@@ -147,18 +175,25 @@ func TestExecuteSetupAppliesManifestsAndConfiguresClusters(t *testing.T) {
 	if len(runner.commands) == 0 {
 		t.Fatalf("expected gcloud commands to be recorded, got none")
 	}
-	assertClusterConfigured(t, handles[0], kccImage)
-	assertClusterConfigured(t, handles[1], kccImage)
+	assertClusterConfigured(t, handles[0], testMCLImage, testSyncerImage)
+	assertClusterConfigured(t, handles[1], testMCLImage, testSyncerImage)
 }
 
-func assertClusterConfigured(t *testing.T, h *clusterHandle, wantImage string) {
+func assertClusterConfigured(t *testing.T, h *clusterHandle, wantMCLImage, wantSyncerImage string) {
 	t.Helper()
 	mclDeploy := &appsv1.Deployment{}
 	if err := h.client.Get(context.Background(), types.NamespacedName{Namespace: "cnrm-system", Name: "multiclusterlease-controller-manager"}, mclDeploy); err != nil {
 		t.Fatalf("expected Deployment multiclusterlease-controller-manager on %s, got error: %v", h.contextName, err)
 	}
-	if gotImage := mclDeploy.Spec.Template.Spec.Containers[0].Image; gotImage != wantImage {
-		t.Fatalf("got MCL image %q on %s, want %q", gotImage, h.contextName, wantImage)
+	if gotImage := mclDeploy.Spec.Template.Spec.Containers[0].Image; gotImage != wantMCLImage {
+		t.Fatalf("got MCL image %q on %s, want %q", gotImage, h.contextName, wantMCLImage)
+	}
+	syncerDeploy := &appsv1.Deployment{}
+	if err := h.client.Get(context.Background(), types.NamespacedName{Namespace: "cnrm-system", Name: "syncer-controller-manager"}, syncerDeploy); err != nil {
+		t.Fatalf("expected Deployment syncer-controller-manager on %s, got error: %v", h.contextName, err)
+	}
+	if gotImage := syncerDeploy.Spec.Template.Spec.Containers[0].Image; gotImage != wantSyncerImage {
+		t.Fatalf("got syncer image %q on %s, want %q", gotImage, h.contextName, wantSyncerImage)
 	}
 	cc, err := fetchConfigConnector(context.Background(), h)
 	if err != nil {
@@ -173,11 +208,10 @@ func assertClusterConfigured(t *testing.T, h *clusterHandle, wantImage string) {
 }
 
 func TestExecuteSetupDryRunPrintsPlannedK8sActionsWithoutMutating(t *testing.T) {
-	const kccImage = "gcr.io/gke-release/cnrm/controller:1.158.0"
 	var stdout bytes.Buffer
 	handles := []*clusterHandle{
-		newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", newBaseConfigConnector(), newManagerStatefulSet(kccImage)),
-		newFakeClusterHandle(t, "gke_proj-b_us-east1_cluster-b", newBaseConfigConnector(), newManagerStatefulSet(kccImage)),
+		newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", newBaseConfigConnector()),
+		newFakeClusterHandle(t, "gke_proj-b_us-east1_cluster-b", newBaseConfigConnector()),
 	}
 	runner := &recordingCommandRunner{}
 	opts := newSetupOptions()
@@ -190,8 +224,8 @@ func TestExecuteSetupDryRunPrintsPlannedK8sActionsWithoutMutating(t *testing.T) 
 	if err != nil {
 		t.Fatalf("executeSetup failed: %v", err)
 	}
-	const wantOutput = `[dry-run] cluster "gke_proj-a_us-central1_cluster-a": apply 8 HA manifests and configure spec.experiments.multiClusterLease (gkeCluster="projects/proj-a/locations/us-central1/clusters/cluster-a", lease=cnrm-system/kcc-multicluster-lease)
-[dry-run] cluster "gke_proj-b_us-east1_cluster-b": apply 8 HA manifests and configure spec.experiments.multiClusterLease (gkeCluster="projects/proj-b/locations/us-east1/clusters/cluster-b", lease=cnrm-system/kcc-multicluster-lease)
+	const wantOutput = `[dry-run] cluster "gke_proj-a_us-central1_cluster-a": apply 14 HA manifests and configure spec.experiments.multiClusterLease (gkeCluster="projects/proj-a/locations/us-central1/clusters/cluster-a", lease=cnrm-system/kcc-multicluster-lease)
+[dry-run] cluster "gke_proj-b_us-east1_cluster-b": apply 14 HA manifests and configure spec.experiments.multiClusterLease (gkeCluster="projects/proj-b/locations/us-east1/clusters/cluster-b", lease=cnrm-system/kcc-multicluster-lease)
 `
 	if stdout.String() != wantOutput {
 		t.Fatalf("got dry-run output:\n%s\nwant:\n%s", stdout.String(), wantOutput)
@@ -203,11 +237,10 @@ func TestExecuteSetupDryRunPrintsPlannedK8sActionsWithoutMutating(t *testing.T) 
 }
 
 func TestExecuteSetupYAMLOnlyRendersWithoutMutating(t *testing.T) {
-	const kccImage = "gcr.io/gke-release/cnrm/controller:1.158.0"
 	var stdout bytes.Buffer
 	handles := []*clusterHandle{
-		newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", newBaseConfigConnector(), newManagerStatefulSet(kccImage)),
-		newFakeClusterHandle(t, "gke_proj-a_us-east1_cluster-b", newBaseConfigConnector(), newManagerStatefulSet(kccImage)),
+		newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a", newBaseConfigConnector()),
+		newFakeClusterHandle(t, "gke_proj-a_us-east1_cluster-b", newBaseConfigConnector()),
 	}
 	runner := &recordingCommandRunner{}
 	opts := newSetupOptions()
@@ -243,21 +276,21 @@ func TestExecuteSetupPreflightErrors(t *testing.T) {
 			name: "non-GKE context name fails preflight before running gcloud",
 			handles: func(t *testing.T) []*clusterHandle {
 				return []*clusterHandle{
-					newFakeClusterHandle(t, "cluster-a", newBaseConfigConnector(), newManagerStatefulSet("img:1")),
-					newFakeClusterHandle(t, "cluster-b", newBaseConfigConnector(), newManagerStatefulSet("img:1")),
+					newFakeClusterHandle(t, "cluster-a", newBaseConfigConnector()),
+					newFakeClusterHandle(t, "cluster-b", newBaseConfigConnector()),
 				}
 			},
 			wantErrPart: "does not match expected GKE context format",
 		},
 		{
-			name: "missing ConfigConnector and missing manager StatefulSet accumulate across clusters",
+			name: "missing ConfigConnector accumulates across clusters",
 			handles: func(t *testing.T) []*clusterHandle {
 				return []*clusterHandle{
 					newFakeClusterHandle(t, "gke_proj-a_us-central1_cluster-a"),
-					newFakeClusterHandle(t, "gke_proj-a_us-east1_cluster-b", newBaseConfigConnector()),
+					newFakeClusterHandle(t, "gke_proj-a_us-east1_cluster-b"),
 				}
 			},
-			wantErrPart: "could not find running Config Connector manager container image",
+			wantErrPart: "missing the \"configconnector.core.cnrm.cloud.google.com\" ConfigConnector object",
 		},
 	}
 
@@ -296,30 +329,6 @@ func newBaseConfigConnector() *operatorv1beta1.ConfigConnector {
 		},
 		Spec: operatorv1beta1.ConfigConnectorSpec{
 			Mode: "cluster",
-		},
-	}
-}
-
-func newManagerStatefulSet(image string) *appsv1.StatefulSet {
-	return &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "cnrm-controller-manager",
-			Namespace: "cnrm-system",
-			Labels: map[string]string{
-				"cnrm.cloud.google.com/component": "cnrm-controller-manager",
-			},
-		},
-		Spec: appsv1.StatefulSetSpec{
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:  "manager",
-							Image: image,
-						},
-					},
-				},
-			},
 		},
 	}
 }
